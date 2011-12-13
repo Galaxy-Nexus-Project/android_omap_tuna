@@ -521,11 +521,6 @@ static int _request_firmware(const struct firmware **firmware_p,
 	if (!firmware_p)
 		return -EINVAL;
 
-	if (WARN_ON(usermodehelper_is_disabled())) {
-		dev_err(device, "firmware: %s will not be loaded\n", name);
-		return -EBUSY;
-	}
-
 	*firmware_p = firmware = kzalloc(sizeof(*firmware), GFP_KERNEL);
 	if (!firmware) {
 		dev_err(device, "%s: kmalloc(struct firmware) failed\n",
@@ -537,6 +532,14 @@ static int _request_firmware(const struct firmware **firmware_p,
 	if (fw_get_builtin_firmware(firmware, name)) {
 		dev_dbg(device, "firmware: using built-in firmware %s\n", name);
 		return 0;
+	}
+
+	read_lock_usermodehelper();
+
+	if (WARN_ON(usermodehelper_is_disabled())) {
+		dev_err(device, "firmware: %s will not be loaded\n", name);
+		retval = -EBUSY;
+		goto out;
 	}
 
 	if (uevent)
@@ -571,6 +574,8 @@ static int _request_firmware(const struct firmware **firmware_p,
 	fw_destroy_instance(fw_priv);
 
 out:
+	read_unlock_usermodehelper();
+
 	if (retval) {
 		release_firmware(firmware);
 		*firmware_p = NULL;

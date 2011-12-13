@@ -621,7 +621,7 @@ static int sched_rt_runtime_exceeded(struct rt_rq *rt_rq)
 	if (rt_rq->rt_throttled)
 		return rt_rq_throttled(rt_rq);
 
-	if (sched_rt_runtime(rt_rq) >= sched_rt_period(rt_rq))
+	if (runtime >= sched_rt_period(rt_rq))
 		return 0;
 
 	balance_runtime(rt_rq);
@@ -1038,7 +1038,7 @@ select_task_rq_rt(struct task_struct *p, int sd_flag, int flags)
 	 */
 	if (curr && unlikely(rt_task(curr)) &&
 	    (curr->rt.nr_cpus_allowed < 2 ||
-	     curr->prio < p->prio) &&
+	     curr->prio <= p->prio) &&
 	    (p->rt.nr_cpus_allowed > 1)) {
 		int target = find_lowest_rq(p);
 
@@ -1569,7 +1569,7 @@ static void task_woken_rt(struct rq *rq, struct task_struct *p)
 	    p->rt.nr_cpus_allowed > 1 &&
 	    rt_task(rq->curr) &&
 	    (rq->curr->rt.nr_cpus_allowed < 2 ||
-	     rq->curr->prio < p->prio))
+	     rq->curr->prio <= p->prio))
 		push_rt_tasks(rq);
 }
 

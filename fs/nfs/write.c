@@ -189,11 +189,64 @@ static int wb_priority(struct writeback_control *wbc)
  * NFS congestion control
  */
 
-int nfs_congestion_kb;
+#define NFS_WAIT_PAGES	(1024L >> (PAGE_SHIFT - 10))
+ int nfs_congestion_kb;
+ 
+/*
+ * SYNC requests will block on (2*limit) and wakeup on (2*limit-NFS_WAIT_PAGES)
+ * ASYNC requests will block on (limit) and wakeup on (limit - NFS_WAIT_PAGES)
+ * In this way SYNC writes will never be blocked by ASYNC ones.
+ */
 
-#define NFS_CONGESTION_ON_THRESH 	(nfs_congestion_kb >> (PAGE_SHIFT-10))
-#define NFS_CONGESTION_OFF_THRESH	\
-	(NFS_CONGESTION_ON_THRESH - (NFS_CONGESTION_ON_THRESH >> 2))
+static void nfs_set_congested(long nr, struct backing_dev_info *bdi)
+{
+	long limit = nfs_congestion_kb >> (PAGE_SHIFT - 10);
+
+	if (nr > limit && !test_bit(BDI_async_congested, &bdi->state))
+		set_bdi_congested(bdi, BLK_RW_ASYNC);
+	else if (nr > 2 * limit && !test_bit(BDI_sync_congested, &bdi->state))
+		set_bdi_congested(bdi, BLK_RW_SYNC);
+}
+
+static void nfs_wait_congested(int is_sync,
+			       struct backing_dev_info *bdi,
+			       wait_queue_head_t *wqh)
+{
+	int waitbit = is_sync ? BDI_sync_congested : BDI_async_congested;
+	DEFINE_WAIT(wait);
+
+	if (!test_bit(waitbit, &bdi->state))
+		return;
+
+	for (;;) {
+		prepare_to_wait(&wqh[is_sync], &wait, TASK_UNINTERRUPTIBLE);
+		if (!test_bit(waitbit, &bdi->state))
+			break;
+
+		io_schedule();
+	}
+	finish_wait(&wqh[is_sync], &wait);
+}
+
+static void nfs_wakeup_congested(long nr,
+				 struct backing_dev_info *bdi,
+				 wait_queue_head_t *wqh)
+{
+	long limit = nfs_congestion_kb >> (PAGE_SHIFT - 10);
+
+	if (nr < 2 * limit - min(limit / 8, NFS_WAIT_PAGES)) {
+		if (test_bit(BDI_sync_congested, &bdi->state))
+			clear_bdi_congested(bdi, BLK_RW_SYNC);
+		if (waitqueue_active(&wqh[BLK_RW_SYNC]))
+			wake_up(&wqh[BLK_RW_SYNC]);
+	}
+	if (nr < limit - min(limit / 8, NFS_WAIT_PAGES)) {
+		if (test_bit(BDI_async_congested, &bdi->state))
+			clear_bdi_congested(bdi, BLK_RW_ASYNC);
+		if (waitqueue_active(&wqh[BLK_RW_ASYNC]))
+			wake_up(&wqh[BLK_RW_ASYNC]);
+	}
+}
 
 static int nfs_set_page_writeback(struct page *page)
 {
@@ -204,11 +257,8 @@ static int nfs_set_page_writeback(struct page *page)
 		struct nfs_server *nfss = NFS_SERVER(inode);
 
 		page_cache_get(page);
-		if (atomic_long_inc_return(&nfss->writeback) >
-				NFS_CONGESTION_ON_THRESH) {
-			set_bdi_congested(&nfss->backing_dev_info,
-						BLK_RW_ASYNC);
-		}
+		nfs_set_congested(atomic_long_inc_return(&nfss->writeback),
+				  &nfss->backing_dev_info);
 	}
 	return ret;
 }
@@ -220,8 +270,10 @@ static void nfs_end_page_writeback(struct page *page)
 
 	end_page_writeback(page);
 	page_cache_release(page);
-	if (atomic_long_dec_return(&nfss->writeback) < NFS_CONGESTION_OFF_THRESH)
-		clear_bdi_congested(&nfss->backing_dev_info, BLK_RW_ASYNC);
+
+	nfs_wakeup_congested(atomic_long_dec_return(&nfss->writeback),
+			     &nfss->backing_dev_info,
+			     nfss->writeback_wait);
 }
 
 static struct nfs_page *nfs_find_and_lock_request(struct page *page, bool nonblock)
@@ -322,10 +374,17 @@ static int nfs_writepage_locked(struct page *page, struct writeback_control *wbc
 
 int nfs_writepage(struct page *page, struct writeback_control *wbc)
 {
+	struct inode *inode = page->mapping->host;
+	struct nfs_server *nfss = NFS_SERVER(inode);
 	int ret;
 
 	ret = nfs_writepage_locked(page, wbc);
 	unlock_page(page);
+
+	nfs_wait_congested(wbc->sync_mode == WB_SYNC_ALL,
+			   &nfss->backing_dev_info,
+			   nfss->writeback_wait);
+
 	return ret;
 }
 
@@ -341,6 +400,7 @@ static int nfs_writepages_callback(struct page *page, struct writeback_control *
 int nfs_writepages(struct address_space *mapping, struct writeback_control *wbc)
 {
 	struct inode *inode = mapping->host;
+	struct nfs_server *nfss = NFS_SERVER(inode);
 	unsigned long *bitlock = &NFS_I(inode)->flags;
 	struct nfs_pageio_descriptor pgio;
 	int err;
@@ -357,7 +417,11 @@ int nfs_writepages(struct address_space *mapping, struct writeback_control *wbc)
 	err = write_cache_pages(mapping, wbc, nfs_writepages_callback, &pgio);
 	nfs_pageio_complete(&pgio);
 
-	clear_bit_unlock(NFS_INO_FLUSHING, bitlock);
+	nfs_wait_congested(wbc->sync_mode == WB_SYNC_ALL,
+			   &nfss->backing_dev_info,
+			   nfss->writeback_wait);
+
+ 	clear_bit_unlock(NFS_INO_FLUSHING, bitlock);
 	smp_mb__after_clear_bit();
 	wake_up_bit(bitlock, NFS_INO_FLUSHING);
 
@@ -428,7 +492,6 @@ static void
 nfs_mark_request_dirty(struct nfs_page *req)
 {
 	__set_page_dirty_nobuffers(req->wb_page);
-	__mark_inode_dirty(req->wb_page->mapping->host, I_DIRTY_DATASYNC);
 }
 
 #if defined(CONFIG_NFS_V3) || defined(CONFIG_NFS_V4)
@@ -762,6 +825,8 @@ int nfs_updatepage(struct file *file, struct page *page,
 	status = nfs_writepage_setup(ctx, page, offset, count);
 	if (status < 0)
 		nfs_set_pageerror(page);
+	else
+		__set_page_dirty_nobuffers(page);
 
 	dprintk("NFS:       nfs_updatepage returns %d (isize %lld)\n",
 			status, (long long)i_size_read(inode));
@@ -1525,6 +1590,10 @@ static int nfs_commit_unstable_pages(struct inode *inode, struct writeback_contr
 	int flags = FLUSH_SYNC;
 	int ret = 0;
 
+	/* no commits means nothing needs to be done */
+	if (!nfsi->ncommit)
+		return ret;
+
 	if (wbc->sync_mode == WB_SYNC_NONE) {
 		/* Don't commit yet if this is a non-blocking flush and there
 		 * are a lot of outstanding writes for this mapping.
@@ -1659,34 +1728,20 @@ out_error:
 int nfs_migrate_page(struct address_space *mapping, struct page *newpage,
 		struct page *page)
 {
-	struct nfs_page *req;
-	int ret;
+	/*
+	 * If PagePrivate is set, then the page is currently associated with
+	 * an in-progress read or write request. Don't try to migrate it.
+	 *
+	 * FIXME: we could do this in principle, but we'll need a way to ensure
+	 *        that we can safely release the inode reference while holding
+	 *        the page lock.
+	 */
+	if (PagePrivate(page))
+		return -EBUSY;
 
 	nfs_fscache_release_page(page, GFP_KERNEL);
 
-	req = nfs_find_and_lock_request(page, false);
-	ret = PTR_ERR(req);
-	if (IS_ERR(req))
-		goto out;
-
-	ret = migrate_page(mapping, newpage, page);
-	if (!req)
-		goto out;
-	if (ret)
-		goto out_unlock;
-	page_cache_get(newpage);
-	spin_lock(&mapping->host->i_lock);
-	req->wb_page = newpage;
-	SetPagePrivate(newpage);
-	set_page_private(newpage, (unsigned long)req);
-	ClearPagePrivate(page);
-	set_page_private(page, 0);
-	spin_unlock(&mapping->host->i_lock);
-	page_cache_release(page);
-out_unlock:
-	nfs_clear_page_tag_locked(req);
-out:
-	return ret;
+	return migrate_page(mapping, newpage, page);
 }
 #endif
 

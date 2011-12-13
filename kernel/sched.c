@@ -71,6 +71,7 @@
 #include <linux/ctype.h>
 #include <linux/ftrace.h>
 #include <linux/slab.h>
+#include <linux/init_task.h>
 #include <linux/cpuacct.h>
 
 #include <asm/tlb.h>
@@ -627,14 +628,18 @@ static inline struct task_group *task_group(struct task_struct *p)
 /* Change a task's cfs_rq and parent entity if it moves across CPUs/groups */
 static inline void set_task_rq(struct task_struct *p, unsigned int cpu)
 {
+#if defined(CONFIG_FAIR_GROUP_SCHED) || defined(CONFIG_RT_GROUP_SCHED)
+	struct task_group *tg = task_group(p);
+#endif
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
-	p->se.cfs_rq = task_group(p)->cfs_rq[cpu];
-	p->se.parent = task_group(p)->se[cpu];
+	p->se.cfs_rq = tg->cfs_rq[cpu];
+	p->se.parent = tg->se[cpu];
 #endif
 
 #ifdef CONFIG_RT_GROUP_SCHED
-	p->rt.rt_rq  = task_group(p)->rt_rq[cpu];
-	p->rt.parent = task_group(p)->rt_se[cpu];
+	p->rt.rt_rq  = tg->rt_rq[cpu];
+	p->rt.parent = tg->rt_se[cpu];
 #endif
 }
 
@@ -3714,30 +3719,6 @@ unsigned long long task_sched_runtime(struct task_struct *p)
 }
 
 /*
- * Return sum_exec_runtime for the thread group.
- * In case the task is currently running, return the sum plus current's
- * pending runtime that have not been accounted yet.
- *
- * Note that the thread group might have other running tasks as well,
- * so the return value not includes other pending runtime that other
- * running tasks might have.
- */
-unsigned long long thread_group_sched_runtime(struct task_struct *p)
-{
-	struct task_cputime totals;
-	unsigned long flags;
-	struct rq *rq;
-	u64 ns;
-
-	rq = task_rq_lock(p, &flags);
-	thread_group_cputime(p, &totals);
-	ns = totals.sum_exec_runtime + do_task_delta_exec(p, rq);
-	task_rq_unlock(rq, p, &flags);
-
-	return ns;
-}
-
-/*
  * Account user cpu time to a process.
  * @p: the process that the cpu time gets accounted to
  * @cputime: the cpu time spent in user space since the last update
@@ -4243,9 +4224,9 @@ pick_next_task(struct rq *rq)
 }
 
 /*
- * schedule() is the main scheduler function.
+ * __schedule() is the main scheduler function.
  */
-asmlinkage void __sched schedule(void)
+static void __sched __schedule(void)
 {
 	struct task_struct *prev, *next;
 	unsigned long *switch_count;
@@ -4286,16 +4267,6 @@ need_resched:
 				if (to_wakeup)
 					try_to_wake_up_local(to_wakeup);
 			}
-
-			/*
-			 * If we are going to sleep and we have plugged IO
-			 * queued, make sure to submit it to avoid deadlocks.
-			 */
-			if (blk_needs_flush_plug(prev)) {
-				raw_spin_unlock(&rq->lock);
-				blk_schedule_flush_plug(prev);
-				raw_spin_lock(&rq->lock);
-			}
 		}
 		switch_count = &prev->nvcsw;
 	}
@@ -4332,6 +4303,26 @@ need_resched:
 	preempt_enable_no_resched();
 	if (need_resched())
 		goto need_resched;
+}
+
+static inline void sched_submit_work(struct task_struct *tsk)
+{
+	if (!tsk->state)
+		return;
+	/*
+	 * If we are going to sleep and we have plugged IO queued,
+	 * make sure to submit it to avoid deadlocks.
+	 */
+	if (blk_needs_flush_plug(tsk))
+		blk_schedule_flush_plug(tsk);
+}
+
+asmlinkage void __sched schedule(void)
+{
+	struct task_struct *tsk = current;
+
+	sched_submit_work(tsk);
+	__schedule();
 }
 EXPORT_SYMBOL(schedule);
 
@@ -4406,7 +4397,7 @@ asmlinkage void __sched notrace preempt_schedule(void)
 
 	do {
 		add_preempt_count_notrace(PREEMPT_ACTIVE);
-		schedule();
+		__schedule();
 		sub_preempt_count_notrace(PREEMPT_ACTIVE);
 
 		/*
@@ -4434,7 +4425,7 @@ asmlinkage void __sched preempt_schedule_irq(void)
 	do {
 		add_preempt_count(PREEMPT_ACTIVE);
 		local_irq_enable();
-		schedule();
+		__schedule();
 		local_irq_disable();
 		sub_preempt_count(PREEMPT_ACTIVE);
 
@@ -5559,7 +5550,7 @@ static inline int should_resched(void)
 static void __cond_resched(void)
 {
 	add_preempt_count(PREEMPT_ACTIVE);
-	schedule();
+	__schedule();
 	sub_preempt_count(PREEMPT_ACTIVE);
 }
 
@@ -5937,6 +5928,9 @@ void __cpuinit init_idle(struct task_struct *idle, int cpu)
 	 */
 	idle->sched_class = &idle_sched_class;
 	ftrace_graph_init_idle_task(idle, cpu);
+#if defined(CONFIG_SMP)
+	sprintf(idle->comm, "%s/%d", INIT_TASK_COMM, cpu);
+#endif
 }
 
 /*
@@ -7414,6 +7408,7 @@ static void __sdt_free(const struct cpumask *cpu_map)
 			struct sched_domain *sd = *per_cpu_ptr(sdd->sd, j);
 			if (sd && (sd->flags & SD_OVERLAP))
 				free_sched_groups(sd->groups, 0);
+			kfree(*per_cpu_ptr(sdd->sd, j));
 			kfree(*per_cpu_ptr(sdd->sg, j));
 			kfree(*per_cpu_ptr(sdd->sgp, j));
 		}
@@ -7648,6 +7643,7 @@ void partition_sched_domains(int ndoms_new, cpumask_var_t doms_new[],
 {
 	int i, j, n;
 	int new_topology;
+	cpumask_var_t doms_temp;
 
 	mutex_lock(&sched_domains_mutex);
 
@@ -7657,14 +7653,20 @@ void partition_sched_domains(int ndoms_new, cpumask_var_t doms_new[],
 	/* Let architecture update cpu core mappings. */
 	new_topology = arch_update_cpu_topology();
 
+	cpumask_andnot(doms_temp, cpu_active_mask, cpu_isolated_map);
+
 	n = doms_new ? ndoms_new : 0;
 
 	/* Destroy deleted domains */
 	for (i = 0; i < ndoms_cur; i++) {
-		for (j = 0; j < n && !new_topology; j++) {
-			if (cpumask_equal(doms_cur[i], doms_new[j])
-			    && dattrs_equal(dattr_cur, i, dattr_new, j))
+		if (!new_topology) {
+			if ((n == 0) && cpumask_subset(doms_cur[i], doms_temp))
 				goto match1;
+			for (j = 0; j < n; j++) {
+				if (cpumask_equal(doms_cur[i], doms_new[j])
+				    && dattrs_equal(dattr_cur, i, dattr_new, j))
+					goto match1;
+			}
 		}
 		/* no match - a current sched domain not in new doms_new[] */
 		detach_destroy_domains(doms_cur[i]);

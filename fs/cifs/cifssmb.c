@@ -1782,7 +1782,7 @@ cifs_async_writev(struct cifs_writedata *wdata)
 		goto async_writev_out;
 
 	/* 1 iov per page + 1 for header */
-	iov = kzalloc((wdata->nr_pages + 1) * sizeof(*iov), GFP_NOFS);
+	iov = kcalloc(wdata->nr_pages + 1, sizeof(*iov), GFP_NOFS);
 	if (iov == NULL) {
 		rc = -ENOMEM;
 		goto async_writev_out;
@@ -4079,7 +4079,8 @@ int CIFSFindNext(const int xid, struct cifs_tcon *tcon,
 	T2_FNEXT_RSP_PARMS *parms;
 	char *response_data;
 	int rc = 0;
-	int bytes_returned, name_len;
+	int bytes_returned;
+	unsigned int name_len;
 	__u16 params, byte_count;
 
 	cFYI(1, "In FindNext");

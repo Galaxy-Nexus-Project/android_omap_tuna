@@ -43,9 +43,9 @@ static const struct platform_suspend_ops *suspend_ops;
  */
 void suspend_set_ops(const struct platform_suspend_ops *ops)
 {
-	mutex_lock(&pm_mutex);
+	lock_system_sleep();
 	suspend_ops = ops;
-	mutex_unlock(&pm_mutex);
+	unlock_system_sleep();
 }
 
 bool valid_state(suspend_state_t state)
@@ -310,7 +310,7 @@ int enter_state(suspend_state_t state)
  */
 int pm_suspend(suspend_state_t state)
 {
-	if (state > PM_SUSPEND_ON && state <= PM_SUSPEND_MAX)
+	if (state > PM_SUSPEND_ON && state < PM_SUSPEND_MAX)
 		return enter_state(state);
 	return -EINVAL;
 }
