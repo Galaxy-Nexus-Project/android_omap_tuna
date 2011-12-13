@@ -22,6 +22,8 @@
  * Function signature : void omap_smc1(u32 fn, u32 arg)
  */
 
+.arch_extension sec  /*For building with Sourcery-G++-Lite-4.5.2*/
+
 ENTRY(omap_smc1)
 	stmfd   sp!, {r2-r12, lr}
 	mov	r12, r0

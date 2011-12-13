@@ -17,6 +17,8 @@
  * MA 02111-1307 USA
  */
 
+.arch_extension sec  /*For building with Sourcery-G++-Lite-4.5.2*/
+
 .text
 
 #define SMICODEPUB_IRQ_END   0xFE

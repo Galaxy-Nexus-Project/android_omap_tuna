@@ -38,6 +38,9 @@
  * @r0: PPA service ID
  * @r3: Pointer to params
 */
+
+.arch_extension sec  /*For building with Sourcery-G++-Lite-4.5.2*/
+
 .macro LM_CALL_PPA_SERVICE_PA
 	mov	r1, #0x0        @ Process ID
 	mov	r2, #0x4	@ Flag
